@@ -1,0 +1,9 @@
+datamart/
+data/*.csv
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.venv/
+outputs/
+work/
