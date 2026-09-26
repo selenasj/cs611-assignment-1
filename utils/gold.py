@@ -1,9 +1,12 @@
-from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType
 
+from utils.asof_join import attach_latest_clickstream
 from utils.config import GOLD_DIR, SILVER_DIR
+from utils.contracts import GOLD_CONTRACTS
 from utils.io_helpers import write_partitioned_parquet
+from utils.validation import validate_gold_outputs
 
 
 def _read_silver(spark: SparkSession, table_name: str) -> DataFrame:
@@ -48,30 +51,10 @@ def build_feature_store(spark: SparkSession) -> DataFrame:
         "left",
     ).drop(fin.customer_id)
 
-    # Restrict clickstream to information available by the application date.
-    cs = clickstream.withColumnRenamed("snapshot_date", "clickstream_snapshot_date")
-    features = features.join(
-        cs,
-        (features.customer_id == cs.customer_id)
-        & (cs.clickstream_snapshot_date <= features.feature_as_of_date),
-        "left",
-    ).drop(cs.customer_id)
-
-    latest_clickstream = Window.partitionBy("loan_id").orderBy(
-        F.col("clickstream_snapshot_date").desc_nulls_last()
-    )
-    features = (
-        features.withColumn("_clickstream_rank", F.row_number().over(latest_clickstream))
-        .filter(F.col("_clickstream_rank") == 1)
-        .drop("_clickstream_rank")
-    )
+    features = attach_latest_clickstream(features, clickstream)
 
     features = (
-        features.withColumn(
-            "clickstream_available",
-            F.when(F.col("clickstream_snapshot_date").isNotNull(), 1).otherwise(0).cast(IntegerType()),
-        )
-        .withColumn("debt_to_annual_income", _safe_ratio("outstanding_debt", "annual_income"))
+        features.withColumn("debt_to_annual_income", _safe_ratio("outstanding_debt", "annual_income"))
         .withColumn("emi_to_monthly_income", _safe_ratio("total_emi_per_month", "monthly_inhand_salary"))
     )
 
@@ -79,8 +62,8 @@ def build_feature_store(spark: SparkSession) -> DataFrame:
     return features
 
 
-def build_label_store(spark: SparkSession, dpd_threshold: int = 30, mob: int = 6) -> DataFrame:
-    loans = _read_silver(spark, "loan_daily")
+def derive_label_store(loans: DataFrame, dpd_threshold: int = 30, mob: int = 6) -> DataFrame:
+    """Create the point-in-time outcome observed at one specified MOB."""
     return (
         loans.filter(F.col("mob") == mob)
         .withColumn(
@@ -99,57 +82,27 @@ def build_label_store(spark: SparkSession, dpd_threshold: int = 30, mob: int = 6
     )
 
 
-def _assert_unique(df: DataFrame, columns: list[str], table_name: str) -> None:
-    duplicates = df.groupBy(*columns).count().filter(F.col("count") > 1).limit(1).count()
-    if duplicates:
-        raise ValueError(f"{table_name} is not unique on {columns}")
+def build_label_store(spark: SparkSession, dpd_threshold: int = 30, mob: int = 6) -> DataFrame:
+    return derive_label_store(_read_silver(spark, "loan_daily"), dpd_threshold, mob)
 
 
-def validate_gold_tables(feature_store: DataFrame, label_store: DataFrame) -> None:
-    feature_count = feature_store.count()
-    label_count = label_store.count()
-    _assert_unique(feature_store, ["loan_id"], "feature_store")
-    _assert_unique(label_store, ["loan_id"], "label_store")
-
-    application_count = feature_store.select("loan_id").distinct().count()
-    if feature_count != application_count:
-        raise ValueError("Feature-store join unexpectedly changed the application grain")
-    if feature_count != label_count:
-        raise ValueError(
-            f"Feature/label row counts differ: feature={feature_count}, label={label_count}"
-        )
-
-    bad_time_order = label_store.filter(
-        F.col("feature_as_of_date") >= F.col("label_observation_date")
-    ).limit(1).count()
-    if bad_time_order:
-        raise ValueError("A label observation date is not later than its feature date")
-
-    future_clickstream = feature_store.filter(
-        F.col("clickstream_snapshot_date") > F.col("feature_as_of_date")
-    ).limit(1).count()
-    if future_clickstream:
-        raise ValueError("Future clickstream data leaked into the feature store")
-
-
-def build_gold_tables(spark: SparkSession) -> dict[str, int]:
+def build_gold_tables(spark: SparkSession) -> dict:
     feature_store = build_feature_store(spark).cache()
     label_store = build_label_store(spark).cache()
-    validate_gold_tables(feature_store, label_store)
-
-    counts = {
-        "feature_store": feature_store.count(),
-        "label_store": label_store.count(),
-        "clickstream_available": feature_store.filter(F.col("clickstream_available") == 1).count(),
-    }
+    result = validate_gold_outputs(
+        feature_store,
+        label_store,
+        GOLD_CONTRACTS["feature_store"],
+        GOLD_CONTRACTS["label_store"],
+    )
 
     write_partitioned_parquet(feature_store, GOLD_DIR / "feature_store", "feature_as_of_date")
     write_partitioned_parquet(label_store, GOLD_DIR / "label_store", "label_observation_date")
 
-    print(f"Gold feature_store: {counts['feature_store']:,} rows")
-    print(f"Gold label_store: {counts['label_store']:,} rows")
-    print(f"Applications with clickstream: {counts['clickstream_available']:,}")
+    print(f"Gold feature_store: {result['tables']['feature_store']['row_count']:,} rows")
+    print(f"Gold label_store: {result['tables']['label_store']['row_count']:,} rows")
+    print(f"Applications with clickstream: {result['clickstream_coverage']['available']:,}")
 
     feature_store.unpersist()
     label_store.unpersist()
-    return counts
+    return result

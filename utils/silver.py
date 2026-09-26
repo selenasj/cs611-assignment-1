@@ -3,7 +3,9 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import DateType, DoubleType, IntegerType, StringType
 
 from utils.config import BRONZE_DIR, SILVER_DIR
+from utils.contracts import SILVER_CONTRACTS
 from utils.io_helpers import write_partitioned_parquet
+from utils.validation import validate_table_contract
 
 
 def _clean_numeric(column_name: str, data_type=DoubleType()):
@@ -207,17 +209,19 @@ def clean_loans(spark: SparkSession) -> DataFrame:
     )
 
 
-def build_silver_tables(spark: SparkSession) -> dict[str, int]:
+def build_silver_tables(spark: SparkSession) -> dict[str, dict]:
     builders = {
         "features_attributes": clean_attributes,
         "features_financials": clean_financials,
         "feature_clickstream": clean_clickstream,
         "loan_daily": clean_loans,
     }
-    counts: dict[str, int] = {}
+    results: dict[str, dict] = {}
     for table_name, builder in builders.items():
-        df = builder(spark)
-        counts[table_name] = df.count()
+        df = builder(spark).cache()
+        result = validate_table_contract(df, SILVER_CONTRACTS[table_name])
+        results[table_name] = result.to_dict()
         write_partitioned_parquet(df, SILVER_DIR / table_name, "snapshot_date")
-        print(f"Silver {table_name}: {counts[table_name]:,} rows")
-    return counts
+        print(f"Silver {table_name}: {result.row_count:,} rows")
+        df.unpersist()
+    return results
