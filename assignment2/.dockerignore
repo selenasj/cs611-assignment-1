@@ -1,0 +1,10 @@
+datamart
+model_bank
+reports
+.git
+__pycache__
+*.pyc
+.ipynb_checkpoints
+.DS_Store
+outputs
+work

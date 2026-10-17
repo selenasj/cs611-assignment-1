@@ -1,0 +1,14 @@
+datamart/*
+!datamart/.gitkeep
+model_bank/*
+!model_bank/.gitkeep
+reports/*
+!reports/.gitkeep
+data/*.csv
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.venv/
+outputs/
+work/
