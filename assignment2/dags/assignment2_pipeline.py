@@ -27,7 +27,7 @@ with DAG(
     dag_id="cs611_assignment2_loan_default",
     description="Application-time loan model training, scoring and delayed-outcome monitoring",
     start_date=datetime(2024, 6, 1),
-    end_date=datetime(2025, 9, 1),
+    end_date=datetime(2025, 8, 1),
     schedule_interval="0 0 1 * *",
     catchup=True,
     is_paused_upon_creation=False,
