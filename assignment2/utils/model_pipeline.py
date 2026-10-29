@@ -7,12 +7,14 @@ training or performance monitoring only after its observation date.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -21,7 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 
 from utils.config import DATAMART_DIR, GOLD_DIR, PROJECT_ROOT
-from utils.feature_policy import APPROVED_NUMERIC_FEATURES
+from utils.feature_policy import APPROVED_NUMERIC_FEATURES, mask_invalid_count_values
 
 
 MODEL_BANK = PROJECT_ROOT / "model_bank"
@@ -47,7 +49,8 @@ def _load_gold() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    return frame[APPROVED_NUMERIC_FEATURES].apply(pd.to_numeric, errors="coerce")
+    numeric = frame[APPROVED_NUMERIC_FEATURES].apply(pd.to_numeric, errors="coerce")
+    return mask_invalid_count_values(numeric)
 
 
 def _candidates() -> dict[str, Pipeline]:
@@ -95,6 +98,13 @@ def population_stability_index(reference: dict, values: np.ndarray | pd.Series) 
     return float(np.sum((current - expected) * np.log((current + epsilon) / (expected + epsilon))))
 
 
+def _stability_flags(psi: float, csi_values: dict[str, float]) -> tuple[bool, bool]:
+    """Return the documented review and alert decisions for distribution shift."""
+    indices = [psi, *csi_values.values()]
+    return (any(value >= 0.10 for value in indices),
+            any(value >= 0.25 for value in indices))
+
+
 def _write_parquet(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
@@ -106,7 +116,41 @@ def _model_path(version: str) -> Path:
     return MODEL_BANK / f"{version}.joblib"
 
 
-def train_and_select(as_of: str | pd.Timestamp) -> dict:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _training_fingerprint() -> dict[str, str]:
+    """Bind an artifact to the Gold inputs and code that produced it."""
+    paths = {
+        "feature_store": GOLD_DIR / "feature_store.parquet",
+        "label_store": GOLD_DIR / "label_store.parquet",
+        "data_pipeline_code": PROJECT_ROOT / "utils" / "data_pipeline.py",
+        "feature_policy_code": PROJECT_ROOT / "utils" / "feature_policy.py",
+        "model_pipeline_code": Path(__file__),
+    }
+    return {
+        **{name: _sha256(path) for name, path in paths.items()},
+        "numpy_version": np.__version__,
+        "pandas_version": pd.__version__,
+        "scikit_learn_version": sklearn.__version__,
+    }
+
+
+def _require_current_model(artifact: dict, version: str, fingerprint: dict[str, str]) -> None:
+    stored = artifact.get("metadata", {}).get("training_fingerprint")
+    if stored != fingerprint:
+        raise RuntimeError(
+            f"Model {version} does not match the current Gold inputs or training code. "
+            "Rerun the full backfill with --force-train to rebuild model versions and predictions."
+        )
+
+
+def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
     date = _day(as_of)
     features, labels = _load_gold()
     scoring_cohort = features[features["feature_as_of_date"].eq(date)]
@@ -115,7 +159,9 @@ def train_and_select(as_of: str | pd.Timestamp) -> dict:
 
     version = "credit_model_" + date.strftime("%Y_%m_%d")
     artifact_path = _model_path(version)
-    if artifact_path.exists():
+    fingerprint = _training_fingerprint()
+    if artifact_path.exists() and not force:
+        _require_current_model(joblib.load(artifact_path), version, fingerprint)
         return {"as_of_date": date.strftime("%Y-%m-%d"), "status": "already_trained",
                 "model_version": version}
 
@@ -161,10 +207,16 @@ def train_and_select(as_of: str | pd.Timestamp) -> dict:
         "feature_names": APPROVED_NUMERIC_FEATURES,
         "selection_metric": "temporal_validation_roc_auc",
         "label_definition": "30+ DPD at MOB 6",
+        "training_fingerprint": fingerprint,
     }
     MODEL_BANK.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"pipeline": selected, "metadata": metadata, "references": references}, artifact_path)
-    (MODEL_BANK / f"{version}.json").write_text(json.dumps(metadata, indent=2))
+    temporary_artifact = artifact_path.with_suffix(".joblib.tmp")
+    joblib.dump({"pipeline": selected, "metadata": metadata, "references": references}, temporary_artifact)
+    temporary_artifact.replace(artifact_path)
+    metadata_path = MODEL_BANK / f"{version}.json"
+    temporary_metadata = metadata_path.with_suffix(".json.tmp")
+    temporary_metadata.write_text(json.dumps(metadata, indent=2))
+    temporary_metadata.replace(metadata_path)
     return {"as_of_date": metadata["as_of_date"], "status": "trained", **metadata}
 
 
@@ -180,6 +232,7 @@ def score_cohort(as_of: str | pd.Timestamp) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Model was not trained for {date_text}: {path}")
     artifact = joblib.load(path)
+    _require_current_model(artifact, version, _training_fingerprint())
     scores = artifact["pipeline"].predict_proba(_matrix(cohort))[:, 1]
     predictions = cohort[["loan_id", "customer_id", "feature_as_of_date"]].copy()
     predictions["model_version"] = version
@@ -201,7 +254,8 @@ def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
     if not prediction_paths:
         raise FileNotFoundError("No predictions exist yet for monitoring")
     labels = labels[["loan_id", "label_observation_date", "label"]]
-    context = features[["loan_id", *MONITORED_FEATURES]]
+    context = features[["loan_id", *APPROVED_NUMERIC_FEATURES]]
+    fingerprint = _training_fingerprint()
     rows = []
     for path in prediction_paths:
         predictions = pd.read_parquet(path)
@@ -210,15 +264,17 @@ def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
         observed = cohort[cohort["label_observation_date"].le(date)].copy()
         version = str(cohort["model_version"].iloc[0])
         artifact = joblib.load(_model_path(version))
+        _require_current_model(artifact, version, fingerprint)
         references = artifact["references"]
         auc = float(roc_auc_score(observed["label"], observed["default_probability"])) if observed["label"].nunique() == 2 else math.nan
         brier = float(brier_score_loss(observed["label"], observed["default_probability"])) if not observed.empty else math.nan
         psi = population_stability_index(references["score"], cohort["default_probability"])
         csi = {f"csi_{name}": population_stability_index(references[name], cohort[name])
                for name in MONITORED_FEATURES}
+        feature_coverage = _matrix(cohort).notna().mean()
         baseline_auc = float(artifact["metadata"]["selected_validation_auc"])
         performance_alert = bool(math.isfinite(auc) and auc < baseline_auc - 0.05)
-        stability_alert = bool(psi >= 0.25 or any(value >= 0.25 for value in csi.values()))
+        stability_review, stability_alert = _stability_flags(psi, csi)
         rows.append({
             "monitoring_as_of_date": date,
             "cohort_date": cohort["feature_as_of_date"].iloc[0],
@@ -231,15 +287,20 @@ def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
             "brier_score": brier,
             "reference_validation_auc": baseline_auc,
             "mean_predicted_risk": float(cohort["default_probability"].mean()),
+            "model_feature_coverage": float(feature_coverage.mean()),
+            "lowest_feature_coverage": float(feature_coverage.min()),
             "psi_score": psi,
             **csi,
             "performance_alert": performance_alert,
+            "stability_review": stability_review,
             "stability_alert": stability_alert,
-            "refresh_review_required": performance_alert or stability_alert,
+            "refresh_review_required": performance_alert or stability_review,
         })
     monitoring = pd.DataFrame(rows).sort_values("cohort_date")
     output = MONITORING_DIR / f"as_of_date={date_text}" / "metrics.parquet"
     _write_parquet(monitoring, output)
     return {"as_of_date": date_text, "status": "monitored", "cohorts": int(len(monitoring)),
             "mature_cohorts": int(monitoring["roc_auc"].notna().sum()),
-            "alerts": int(monitoring["refresh_review_required"].sum()), "path": str(output)}
+            "reviews": int(monitoring["refresh_review_required"].sum()),
+            "alerts": int((monitoring["performance_alert"] | monitoring["stability_alert"]).sum()),
+            "path": str(output)}

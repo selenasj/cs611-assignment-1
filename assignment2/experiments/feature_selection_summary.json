@@ -1,0 +1,56 @@
+{
+  "development_cohorts": [
+    "2024-06-01",
+    "2024-07-01",
+    "2024-08-01",
+    "2024-09-01",
+    "2024-10-01",
+    "2024-11-01",
+    "2024-12-01"
+  ],
+  "holdout_cohort": "2025-01-01",
+  "minimum_material_auc_lift": 0.005,
+  "minimum_positive_cohort_share": 0.6,
+  "development_comparisons": [
+    {
+      "feature_set": "all_sample_ideas",
+      "mean_auc": 0.7907196823363492,
+      "mean_lift_vs_baseline": -0.00022863556323055828,
+      "positive_cohorts": 4
+    },
+    {
+      "feature_set": "assignment1_baseline",
+      "mean_auc": 0.7909483178995796,
+      "mean_lift_vs_baseline": 0.0,
+      "positive_cohorts": 0
+    },
+    {
+      "feature_set": "sample1_categories",
+      "mean_auc": 0.7929722171042234,
+      "mean_lift_vs_baseline": 0.002023899204643853,
+      "positive_cohorts": 5
+    },
+    {
+      "feature_set": "sample2_financial_ratios",
+      "mean_auc": 0.7895831914074011,
+      "mean_lift_vs_baseline": -0.0013651264921786335,
+      "positive_cohorts": 3
+    },
+    {
+      "feature_set": "sample3_log_ratios",
+      "mean_auc": 0.7910660558823358,
+      "mean_lift_vs_baseline": 0.00011773798275622431,
+      "positive_cohorts": 4
+    }
+  ],
+  "locked_feature_set": "assignment1_baseline",
+  "holdout_confirmation": {
+    "cohort_date": "2025-01-01",
+    "feature_set": "assignment1_baseline",
+    "selected_algorithm": "hist_gradient_boosting",
+    "validation_auc": 0.7975538798119444,
+    "future_cohort_auc": 0.7665469282490559,
+    "future_rows": 526
+  },
+  "prior_exposure_caveat": "January 2025 results appeared in an earlier eight-cohort exploratory analysis. This revised split keeps it out of feature selection, but it is not a historically blind holdout."
+}

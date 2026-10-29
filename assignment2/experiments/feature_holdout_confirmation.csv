@@ -1,0 +1,2 @@
+cohort_date,feature_set,selected_algorithm,validation_auc,future_cohort_auc,future_rows
+2025-01-01,assignment1_baseline,hist_gradient_boosting,0.7975538798119444,0.7665469282490559,526

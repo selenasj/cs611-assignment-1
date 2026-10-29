@@ -6,6 +6,8 @@ exist across all cohorts.  Categorical and time-limited clickstream fields stay
 outside this check because they need separate encoding or coverage decisions.
 """
 
+import pandas as pd
+
 
 APPROVED_NUMERIC_FEATURES = [
     "loan_amt",
@@ -32,6 +34,21 @@ APPROVED_CATEGORICAL_FEATURES = [
 ]
 
 CLICKSTREAM_FEATURES = [f"fe_{index}" for index in range(1, 21)]
+
+# Counts below zero are impossible. Keep the original values in Silver and Gold
+# for audit, but treat them as missing at every model/experiment input boundary.
+NONNEGATIVE_COUNT_FEATURES = (
+    "num_bank_accounts", "num_credit_card", "num_of_loan", "num_credit_inquiries",
+)
+
+
+def mask_invalid_count_values(frame: pd.DataFrame) -> pd.DataFrame:
+    cleaned = frame.copy()
+    for name in NONNEGATIVE_COUNT_FEATURES:
+        if name in cleaned:
+            values = pd.to_numeric(cleaned[name], errors="coerce")
+            cleaned[name] = values.mask(values.lt(0))
+    return cleaned
 
 # These columns remain in Gold for traceability or later investigation, but the
 # reasons below keep them out of the current sanity model.

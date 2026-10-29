@@ -209,11 +209,13 @@ def _validate(features: pd.DataFrame, labels: pd.DataFrame) -> dict:
 
 def prepare_datamart(force: bool = False) -> dict:
     fingerprints = {name: _sha256(path) for name, path in SOURCE_FILES.items()}
+    transform_code_sha256 = _sha256(Path(__file__))
     manifest_path = DATAMART_DIR / "data_manifest.json"
     expected_outputs = [GOLD_DIR / "feature_store.parquet", GOLD_DIR / "label_store.parquet"]
     if not force and manifest_path.exists() and all(path.exists() for path in expected_outputs):
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("source_sha256") == fingerprints:
+        if (manifest.get("source_sha256") == fingerprints
+                and manifest.get("transform_code_sha256") == transform_code_sha256):
             return manifest
 
     raw = {name: pd.read_csv(path, dtype="string", keep_default_na=False)
@@ -235,7 +237,9 @@ def prepare_datamart(force: bool = False) -> dict:
     summary = _validate(features, labels)
     _save(features, expected_outputs[0])
     _save(labels, expected_outputs[1])
-    manifest = {"source_sha256": fingerprints, "summary": summary,
+    manifest = {"source_sha256": fingerprints,
+                "transform_code_sha256": transform_code_sha256,
+                "summary": summary,
                 "lineage": "CS611 Assignment 1: application-time features and 30+ DPD at MOB 6"}
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2))
