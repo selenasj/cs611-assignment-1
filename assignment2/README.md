@@ -21,8 +21,11 @@ Open <http://localhost:8080> and sign in with `admin` / `admin`. The DAG is
 `cs611_assignment2_loan_default`. Its 15 monthly logical dates run from
 1 June 2024 through 1 August 2025. The first eight dates have application
 cohorts; later dates add monitoring as their month-six labels become available.
-The DAG starts its historical catchup when the scheduler loads it. You can also
-trigger a single date from the UI.
+The DAG starts its historical catchup when the scheduler loads it. Its six tasks
+prepare data, train/register a candidate, simulate review/promotion, score both
+strategies, monitor both strategies, and render evidence. A clean full catchup
+is required before running an isolated later date, because monitoring consumes
+earlier prediction cohorts.
 
 For a local run without Airflow:
 
@@ -46,15 +49,21 @@ python main.py backfill --start 2024-06-01 --end 2025-08-01 --force-train
 - `datamart/gold/feature_store.parquet` and `label_store.parquet`: one row per loan application.
 - `model_bank/credit_model_YYYY_MM_DD.joblib`: selected estimator, fitted preprocessing and monitoring reference distributions; companion JSON records the selection evidence.
 - `datamart/gold/model_predictions/cohort_date=...`: per-loan probability, model version and date.
-- `datamart/gold/model_monitoring/as_of_date=...`: performance, stability, and model-feature coverage by scored cohort.
-- `reports/monitoring_as_of_...png` and `.csv`: visual and tabular evidence.
+- `datamart/gold/model_monitoring/as_of_date=...`: monthly-version performance, PSI, all 16 CSI values, all 16 missing rates, maximum CSI and review flags.
+- `datamart/gold/model_feature_monitoring/as_of_date=...`: one row per cohort and input, including CSI, reference/current missing rates and their difference.
+- `datamart/gold/fixed_model_predictions`, `fixed_model_monitoring` and `fixed_model_feature_monitoring`: the separate frozen-June comparator.
+- `model_bank/registry/historical.json`: explicitly simulated approvals and deployment history.
+- `model_bank/registry/production.json`: separate manually recorded approvals and deployment history; historical decisions cannot authorize this scope.
+- `reports/monitoring_as_of_...png`, `feature_monitoring_as_of_...png` and CSVs: strategy comparisons, complete input monitoring and auditable tabular evidence.
 
-All writes are idempotent for a given date. The data stage skips unchanged
+Prediction/monitoring writes and repeated governance decisions are idempotent for a given date. The data stage skips unchanged
 source files and unchanged preparation code by SHA-256. Each saved model also
 records fingerprints of its Gold inputs, feature/training code and library
 versions. A mismatch blocks reuse until `--force-train` rebuilds the models.
 Repeated scoring and monitoring overwrite the same date partition rather than
-appending duplicates.
+appending duplicates. A forced full replay archives and resets simulated
+governance decisions. It refuses to overwrite an artifact registered in the
+production scope; production changes require a new version.
 
 ## Model decisions
 
@@ -110,12 +119,20 @@ shown January outcomes. The final monitoring table's eight-cohort average is
 descriptive and must not be presented as independent feature-selection evidence.
 
 Monitoring writes ROC AUC and Brier score only when labels have matured.
-Prediction PSI and three feature CSI values can be computed immediately.
+Prediction PSI and all 16 model-input CSI values can be computed immediately.
+References and current inputs use the same domain masking before imputation;
+negative counts and nonfinite values are missing, with an explicit missing bin.
+Constant and entirely missing references are supported. The monitoring Gold
+tables retain every CSI and missing rate, maximum CSI and its feature name,
+and the greatest missing-rate increase. An increase of at least 5 percentage
+points versus that version's training reference prompts a source-quality review.
 It also stores the mean and lowest nonmissing coverage across the 16 model
 features before imputation, so a deteriorating source can be investigated.
 PSI/CSI at 0.10 prompts review; 0.25 prompts an alert. An observed AUC more
 than 0.05 below that version's temporal validation AUC also prompts review.
-These thresholds are documented decisions, not claims that drift occurred.
+These thresholds are documented project decisions, not claims that drift occurred.
+The candidate validation floor of ROC AUC 0.65 is also a coursework policy,
+not an independently established lending acceptance threshold.
 
 ## Data and deployment limits
 
@@ -131,5 +148,80 @@ would be set from lending costs, approval capacity, and recall targets.
 
 The provided Docker Compose uses Airflow's SQLite metadata database and
 SequentialExecutor for a single-machine coursework run. A production deployment
-would use a supported server database, an approval gate for champion promotion,
-and a previous-model rollback path.
+would use a supported server database and authenticated, role-based approval
+controls. The local approval, promotion and rollback commands below demonstrate
+the version-selection behavior without providing those security controls.
+
+## Fixed model comparison
+
+The comparator is fixed in advance in code as `credit_model_2024_06_01`, the
+first model in the replay. It is never refreshed or selected from later cohort
+results. The monthly strategy uses the approved version effective at each
+cohort date. Both score the same 4,024 applications, write to separate Gold
+partitions, and wait for the same MOB 6 observation dates before calculating AUC
+and Brier score. Each strategy uses its own model's training reference for PSI
+and CSI. The fixed comparator consequently has a single fixed reference across
+all eight application cohorts.
+
+`reports/strategy_comparison_as_of_2025-08-01.csv` reports the paired results.
+`experiments/fixed_model_comparison.csv` is a checked-in snapshot of that clean
+container replay; rerunning the DAG regenerates the reports version.
+The cohort-size-weighted AUC summaries are descriptive means of cohort AUCs,
+not pooled AUCs or evidence of a statistically significant strategy advantage.
+This additional retrospective comparison does not restore a blind holdout:
+January outcomes had already been seen, as disclosed above. No comparator
+result changes feature selection, candidate approval or the deployed strategy.
+
+## Approval, promotion and rollback
+
+Historical replay and production are separate registry scopes. The historical
+DAG records `decision_mode=policy_simulation` with the reviewer
+`historical_policy_simulation`. It reproduces an approval-policy decision for
+coursework; it does not claim that a human approved a 2024 release. Simulated
+approvals never authorize production scoring.
+
+Every trained artifact starts as a candidate. Approval checks the training
+fingerprint, mature-label chronology, exact feature contract, all 16 monitoring
+references, validation AUC >= 0.65, finite probabilities and current input
+availability. PSI or any CSI >= 0.25 blocks approval/promotion. Values >= 0.10
+require review and are included in the recorded assessment; the historical
+review is explicitly simulated. A fully missing input also blocks promotion.
+Promotion rechecks these gates. Ordinary monitoring additionally flags a
+5-percentage-point missingness increase and an AUC drop > 0.05 from validation.
+Monitoring flags request investigation; they do not silently authorize a release.
+
+Standalone `score` defaults to the production scope. It fails until an approved
+model has been explicitly promoted, and writes to `production_predictions`
+without overwriting historical results. Both approval and deployment commands
+require a nonempty reviewer and reason. For example, after the historical replay:
+
+```bash
+docker compose exec airflow-scheduler python main.py approve --model-version credit_model_2024_06_01 --as-of 2024-06-01 --reviewer course_reviewer --reason "Reviewed validation and input monitoring"
+docker compose exec airflow-scheduler python main.py promote --model-version credit_model_2024_06_01 --as-of 2024-06-01 --reviewer course_operator --reason "Deploy approved release"
+docker compose exec airflow-scheduler python main.py score --as-of 2024-06-01 --scope production
+```
+
+To demonstrate a later deployment and an explicit rollback:
+
+```bash
+docker compose exec airflow-scheduler python main.py approve --model-version credit_model_2024_07_01 --as-of 2024-07-01 --reviewer course_reviewer --reason "Reviewed July candidate"
+docker compose exec airflow-scheduler python main.py promote --model-version credit_model_2024_07_01 --as-of 2024-07-01 --reviewer course_operator --reason "Deploy approved July release"
+docker compose exec airflow-scheduler python main.py rollback --model-version credit_model_2024_06_01 --as-of 2024-08-01 --reviewer course_operator --reason "Restore previously deployed approved version"
+docker compose exec airflow-scheduler python main.py registry-status --scope production
+```
+
+The inference resolver reads the deployment effective at the scoring date, so
+the rollback changes subsequent version selection while preserving July's
+history. Rollback requires a different, previously deployed approved artifact;
+it does not erase existing predictions. Explicitly rerun affected scoring dates
+if predictions should be regenerated. The audit trail records scope, artifact
+hash, reviewer, reason, effective date and actual UTC recording time. Replacing
+a registered artifact or inserting a new deployment before the latest effective
+date is rejected. Registry writes use a file lock and atomic replacement.
+
+The reviewer is entered manually; this local coursework registry does not
+provide authentication, role-based authorization, cryptographic signatures or
+a production-grade model-serving system. Batch scoring, the 0.5 demonstration
+cutoff and same-day feature availability remain the operating limits described
+above. The manual commands demonstrate controlled release and rollback; they
+do not automate business approval.

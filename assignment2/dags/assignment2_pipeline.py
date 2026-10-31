@@ -19,7 +19,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.data_pipeline import prepare_datamart
-from utils.model_pipeline import monitor_as_of, score_cohort, train_and_select
+from utils.model_pipeline import monitor_as_of, score_both_strategies, train_and_select
+from utils.governance import simulate_review_and_promote
 from utils.reporting import render_monitoring
 
 
@@ -38,11 +39,13 @@ with DAG(
     prepare = PythonOperator(task_id="prepare_assignment1_datamart", python_callable=prepare_datamart)
     train = PythonOperator(task_id="train_compare_select_model", python_callable=train_and_select,
                            op_kwargs={"as_of": "{{ ds }}"})
-    score = PythonOperator(task_id="score_application_cohort", python_callable=score_cohort,
+    review = PythonOperator(task_id="simulate_review_and_promote", python_callable=simulate_review_and_promote,
+                            op_kwargs={"as_of": "{{ ds }}"})
+    score = PythonOperator(task_id="score_monthly_and_fixed_models", python_callable=score_both_strategies,
                            op_kwargs={"as_of": "{{ ds }}"})
     monitor = PythonOperator(task_id="write_monitoring_gold", python_callable=monitor_as_of,
                              op_kwargs={"as_of": "{{ ds }}"})
     chart = PythonOperator(task_id="render_monitoring_chart", python_callable=render_monitoring,
                            op_kwargs={"as_of": "{{ ds }}"})
 
-    prepare >> train >> score >> monitor >> chart
+    prepare >> train >> review >> score >> monitor >> chart

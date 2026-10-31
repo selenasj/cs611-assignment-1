@@ -24,12 +24,19 @@ from sklearn.preprocessing import RobustScaler
 
 from utils.config import DATAMART_DIR, GOLD_DIR, PROJECT_ROOT
 from utils.feature_policy import APPROVED_NUMERIC_FEATURES, mask_invalid_count_values
+from utils.governance import register_candidate, resolve_approved_model, require_unregistered_for_rebuild
 
 
 MODEL_BANK = PROJECT_ROOT / "model_bank"
 PREDICTIONS_DIR = GOLD_DIR / "model_predictions"
 MONITORING_DIR = GOLD_DIR / "model_monitoring"
-MONITORED_FEATURES = ["age", "annual_income", "debt_to_annual_income"]
+MONITORED_FEATURES = list(APPROVED_NUMERIC_FEATURES)
+FEATURE_MONITORING_DIR = GOLD_DIR / "model_feature_monitoring"
+FIXED_PREDICTIONS_DIR = GOLD_DIR / "fixed_model_predictions"
+FIXED_MONITORING_DIR = GOLD_DIR / "fixed_model_monitoring"
+FIXED_FEATURE_MONITORING_DIR = GOLD_DIR / "fixed_model_feature_monitoring"
+FIXED_MODEL_VERSION = "credit_model_2024_06_01"
+MIN_VALIDATION_AUC = 0.65
 SCORE_THRESHOLD = 0.5
 
 
@@ -50,7 +57,7 @@ def _load_gold() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def _matrix(frame: pd.DataFrame) -> pd.DataFrame:
     numeric = frame[APPROVED_NUMERIC_FEATURES].apply(pd.to_numeric, errors="coerce")
-    return mask_invalid_count_values(numeric)
+    return mask_invalid_count_values(numeric).replace([np.inf, -np.inf], np.nan)
 
 
 def _candidates() -> dict[str, Pipeline]:
@@ -72,14 +79,20 @@ def _candidates() -> dict[str, Pipeline]:
 
 def _reference(values: np.ndarray | pd.Series, bins: int = 10) -> dict:
     array = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+    if len(array) == 0:
+        raise ValueError("Cannot make a monitoring reference from zero rows")
     finite = array[np.isfinite(array)]
     if len(finite) == 0:
-        raise ValueError("Cannot make a monitoring reference from all-missing values")
+        return {"edges": [-np.inf, np.inf], "proportions": [0.0, 1.0], "n": int(len(array))}
     edges = np.unique(np.quantile(finite, np.linspace(0, 1, bins + 1)))
     if len(edges) < 2:
         pivot = float(edges[0])
-        edges = np.array([pivot - 0.5, pivot + 0.5])
-    edges[0], edges[-1] = -np.inf, np.inf
+        # A distinct middle bin is needed to detect changes from a constant
+        # input (e.g. loan tenure); one [-inf, inf] bin would hide every change.
+        width = max(abs(pivot) * 1e-6, 1e-6)
+        edges = np.array([-np.inf, pivot - width, pivot + width, np.inf])
+    else:
+        edges[0], edges[-1] = -np.inf, np.inf
     counts = np.histogram(finite, bins=edges)[0].astype(float)
     counts = np.append(counts, len(array) - len(finite))
     return {"edges": edges.tolist(), "proportions": (counts / len(array)).tolist(),
@@ -159,9 +172,12 @@ def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
 
     version = "credit_model_" + date.strftime("%Y_%m_%d")
     artifact_path = _model_path(version)
+    if force and artifact_path.exists():
+        require_unregistered_for_rebuild(version)
     fingerprint = _training_fingerprint()
     if artifact_path.exists() and not force:
         _require_current_model(joblib.load(artifact_path), version, fingerprint)
+        register_candidate(version)
         return {"as_of_date": date.strftime("%Y-%m-%d"), "status": "already_trained",
                 "model_version": version}
 
@@ -190,8 +206,9 @@ def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
     selected.fit(_matrix(matured), matured["label"])
     reference_scores = selected.predict_proba(_matrix(matured))[:, 1]
     references = {"score": _reference(reference_scores)}
+    monitoring_inputs = _matrix(matured)
     for feature in MONITORED_FEATURES:
-        references[feature] = _reference(pd.to_numeric(matured[feature], errors="coerce"))
+        references[feature] = _reference(monitoring_inputs[feature])
 
     metadata = {
         "model_version": version,
@@ -205,6 +222,8 @@ def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
         "latest_label_observation_date": matured["label_observation_date"].max().strftime("%Y-%m-%d"),
         "validation_cohorts": [pd.Timestamp(item).strftime("%Y-%m-%d") for item in validation_dates],
         "feature_names": APPROVED_NUMERIC_FEATURES,
+        "monitored_features": MONITORED_FEATURES,
+        "monitoring_input_policy": "domain masking before imputation; explicit missing bin",
         "selection_metric": "temporal_validation_roc_auc",
         "label_definition": "30+ DPD at MOB 6",
         "training_fingerprint": fingerprint,
@@ -217,17 +236,63 @@ def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
     temporary_metadata = metadata_path.with_suffix(".json.tmp")
     temporary_metadata.write_text(json.dumps(metadata, indent=2))
     temporary_metadata.replace(metadata_path)
+    register_candidate(version)
     return {"as_of_date": metadata["as_of_date"], "status": "trained", **metadata}
 
 
-def score_cohort(as_of: str | pd.Timestamp) -> dict:
+def assess_for_promotion(version: str, as_of: str) -> dict:
+    """Use only current inputs and already observed labels for approval gates."""
     date = _day(as_of)
+    artifact = joblib.load(_model_path(version))
+    _require_current_model(artifact, version, _training_fingerprint())
+    metadata = artifact["metadata"]
+    features, _ = _load_gold()
+    cohort = features[features["feature_as_of_date"].eq(date)]
+    blocked = []
+    if metadata["as_of_date"] > date.strftime("%Y-%m-%d"):
+        blocked.append("model_trained_after_effective_date")
+    if metadata["latest_label_observation_date"] > metadata["as_of_date"]:
+        blocked.append("training_label_not_mature")
+    if metadata["selected_validation_auc"] < MIN_VALIDATION_AUC:
+        blocked.append("validation_auc_below_0.65")
+    if metadata["feature_names"] != APPROVED_NUMERIC_FEATURES:
+        blocked.append("unexpected_feature_contract")
+    if any(name not in artifact["references"] for name in MONITORED_FEATURES):
+        blocked.append("incomplete_monitoring_references")
+    if cohort.empty:
+        blocked.append("no_current_application_inputs")
+        return {"promotion_eligible": False, "blocked_reasons": blocked,
+                "review_required": True, "as_of_date": str(date.date())}
+    matrix = _matrix(cohort)
+    scores = artifact["pipeline"].predict_proba(matrix)[:, 1]
+    psi = population_stability_index(artifact["references"]["score"], scores)
+    csi = {name: population_stability_index(artifact["references"][name], matrix[name])
+           for name in MONITORED_FEATURES}
+    review, alert = _stability_flags(psi, csi)
+    missing_rates = matrix.isna().mean()
+    if not np.isfinite(scores).all() or not ((scores >= 0) & (scores <= 1)).all():
+        blocked.append("invalid_probability")
+    if missing_rates.eq(1).any():
+        blocked.append("entire_model_input_missing")
+    if alert:
+        blocked.append("psi_or_csi_at_least_0.25")
+    return {"promotion_eligible": not blocked, "blocked_reasons": blocked,
+            "review_required": review, "as_of_date": str(date.date()),
+            "validation_auc": metadata["selected_validation_auc"],
+            "minimum_validation_auc": MIN_VALIDATION_AUC,
+            "psi_score": psi, "max_csi": max(csi.values()),
+            "monitored_feature_count": len(csi),
+            "max_missing_rate": float(missing_rates.max())}
+
+
+def _score_with_version(date: pd.Timestamp, version: str, output_dir: Path,
+                        strategy: str, scope: str) -> dict:
+    date = _day(date)
     date_text = date.strftime("%Y-%m-%d")
     features, _ = _load_gold()
     cohort = features[features["feature_as_of_date"].eq(date)].copy()
     if cohort.empty:
         return {"as_of_date": date_text, "status": "no_application_cohort", "rows": 0}
-    version = "credit_model_" + date.strftime("%Y_%m_%d")
     path = _model_path(version)
     if not path.exists():
         raise FileNotFoundError(f"Model was not trained for {date_text}: {path}")
@@ -239,17 +304,64 @@ def score_cohort(as_of: str | pd.Timestamp) -> dict:
     predictions["score_as_of_date"] = date
     predictions["default_probability"] = scores
     predictions["high_risk_flag"] = (scores >= SCORE_THRESHOLD).astype("int8")
-    output = PREDICTIONS_DIR / f"cohort_date={date_text}" / "predictions.parquet"
+    predictions["scoring_strategy"] = strategy
+    predictions["governance_scope"] = scope
+    output = output_dir / f"cohort_date={date_text}" / "predictions.parquet"
     _write_parquet(predictions, output)
     return {"as_of_date": date_text, "status": "scored", "rows": int(len(cohort)),
             "model_version": version, "path": str(output)}
 
 
-def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
+def score_cohort(as_of: str | pd.Timestamp, scope: str = "historical") -> dict:
+    date = _day(as_of)
+    features, _ = _load_gold()
+    if not features["feature_as_of_date"].eq(date).any():
+        return {"as_of_date": str(date.date()), "status": "no_application_cohort", "rows": 0}
+    version = resolve_approved_model(str(date.date()), scope)
+    # Production output must not overwrite historical replay evidence.
+    output = PREDICTIONS_DIR if scope == "historical" else GOLD_DIR / "production_predictions"
+    return _score_with_version(date, version, output, "monthly_selected", scope)
+
+
+def score_fixed_model(as_of: str | pd.Timestamp) -> dict:
+    date = _day(as_of)
+    approved_anchor = resolve_approved_model("2024-06-01", "historical")
+    if approved_anchor != FIXED_MODEL_VERSION:
+        raise RuntimeError("The fixed comparator must use the predefined June 2024 model")
+    return _score_with_version(date, FIXED_MODEL_VERSION, FIXED_PREDICTIONS_DIR,
+                               "fixed_june_2024", "historical")
+
+
+def score_both_strategies(as_of: str) -> dict:
+    return {"monthly_selected": score_cohort(as_of), "fixed_june_2024": score_fixed_model(as_of)}
+
+
+def feature_monitoring(references: dict, cohort: pd.DataFrame) -> tuple[dict, dict, list[dict]]:
+    """Compare all model inputs under the same domain/missing-value policy."""
+    matrix = _matrix(cohort)
+    csi = {}
+    missing_rates = {}
+    details = []
+    for name in MONITORED_FEATURES:
+        value = population_stability_index(references[name], matrix[name])
+        missing = float(matrix[name].isna().mean())
+        baseline_missing = float(references[name]["proportions"][-1])
+        csi[f"csi_{name}"] = value
+        missing_rates[f"missing_rate_{name}"] = missing
+        details.append({"feature_name": name, "csi": value,
+                        "missing_rate": missing, "reference_missing_rate": baseline_missing,
+                        "missing_rate_change": missing - baseline_missing,
+                        "stability_review": value >= 0.10, "stability_alert": value >= 0.25,
+                        "missingness_review": missing - baseline_missing >= 0.05})
+    return csi, missing_rates, details
+
+
+def _monitor_strategy(as_of: str | pd.Timestamp, predictions_dir: Path,
+                      monitoring_dir: Path, detail_dir: Path, strategy: str) -> dict:
     date = _day(as_of)
     date_text = date.strftime("%Y-%m-%d")
     features, labels = _load_gold()
-    prediction_paths = sorted(PREDICTIONS_DIR.glob("cohort_date=*/predictions.parquet"))
+    prediction_paths = sorted(predictions_dir.glob("cohort_date=*/predictions.parquet"))
     prediction_paths = [p for p in prediction_paths if p.parent.name.split("=", 1)[1] <= date_text]
     if not prediction_paths:
         raise FileNotFoundError("No predictions exist yet for monitoring")
@@ -257,6 +369,7 @@ def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
     context = features[["loan_id", *APPROVED_NUMERIC_FEATURES]]
     fingerprint = _training_fingerprint()
     rows = []
+    feature_rows = []
     for path in prediction_paths:
         predictions = pd.read_parquet(path)
         cohort = predictions.merge(labels, on="loan_id", how="left", validate="one_to_one")
@@ -269,16 +382,21 @@ def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
         auc = float(roc_auc_score(observed["label"], observed["default_probability"])) if observed["label"].nunique() == 2 else math.nan
         brier = float(brier_score_loss(observed["label"], observed["default_probability"])) if not observed.empty else math.nan
         psi = population_stability_index(references["score"], cohort["default_probability"])
-        csi = {f"csi_{name}": population_stability_index(references[name], cohort[name])
-               for name in MONITORED_FEATURES}
+        csi, missing_rates, details = feature_monitoring(references, cohort)
+        for detail in details:
+            feature_rows.append({"monitoring_as_of_date": date,
+                                 "cohort_date": cohort["feature_as_of_date"].iloc[0],
+                                 "model_version": version, "scoring_strategy": strategy, **detail})
         feature_coverage = _matrix(cohort).notna().mean()
         baseline_auc = float(artifact["metadata"]["selected_validation_auc"])
         performance_alert = bool(math.isfinite(auc) and auc < baseline_auc - 0.05)
         stability_review, stability_alert = _stability_flags(psi, csi)
+        missingness_review = any(detail["missingness_review"] for detail in details)
         rows.append({
             "monitoring_as_of_date": date,
             "cohort_date": cohort["feature_as_of_date"].iloc[0],
             "model_version": version,
+            "scoring_strategy": strategy,
             "algorithm": artifact["metadata"]["selected_algorithm"],
             "n_predictions": int(len(cohort)),
             "n_observed_labels": int(len(observed)),
@@ -291,16 +409,32 @@ def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
             "lowest_feature_coverage": float(feature_coverage.min()),
             "psi_score": psi,
             **csi,
+            **missing_rates,
+            "monitored_feature_count": len(MONITORED_FEATURES),
+            "max_csi": max(csi.values()),
+            "max_csi_feature": max(csi, key=csi.get).removeprefix("csi_"),
+            "max_missing_rate": max(missing_rates.values()),
+            "max_missing_rate_increase": max(detail["missing_rate_change"] for detail in details),
             "performance_alert": performance_alert,
             "stability_review": stability_review,
             "stability_alert": stability_alert,
-            "refresh_review_required": performance_alert or stability_review,
+            "missingness_review": missingness_review,
+            "refresh_review_required": performance_alert or stability_review or missingness_review,
         })
     monitoring = pd.DataFrame(rows).sort_values("cohort_date")
-    output = MONITORING_DIR / f"as_of_date={date_text}" / "metrics.parquet"
+    output = monitoring_dir / f"as_of_date={date_text}" / "metrics.parquet"
     _write_parquet(monitoring, output)
+    _write_parquet(pd.DataFrame(feature_rows), detail_dir / f"as_of_date={date_text}" / "metrics.parquet")
     return {"as_of_date": date_text, "status": "monitored", "cohorts": int(len(monitoring)),
             "mature_cohorts": int(monitoring["roc_auc"].notna().sum()),
             "reviews": int(monitoring["refresh_review_required"].sum()),
             "alerts": int((monitoring["performance_alert"] | monitoring["stability_alert"]).sum()),
             "path": str(output)}
+
+
+def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
+    monthly = _monitor_strategy(as_of, PREDICTIONS_DIR, MONITORING_DIR,
+                                FEATURE_MONITORING_DIR, "monthly_selected")
+    fixed = _monitor_strategy(as_of, FIXED_PREDICTIONS_DIR, FIXED_MONITORING_DIR,
+                              FIXED_FEATURE_MONITORING_DIR, "fixed_june_2024")
+    return {**monthly, "fixed_comparator": fixed}
