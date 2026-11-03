@@ -1,1 +1,1 @@
-https://github.com/selenasj/cs611-assignment-1&2
+https://github.com/selenasj/cs611-assignment-1
