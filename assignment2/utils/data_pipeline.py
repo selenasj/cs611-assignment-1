@@ -151,8 +151,9 @@ def _clean_loans(raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _build_gold(attributes: pd.DataFrame, financials: pd.DataFrame,
-                clickstream: pd.DataFrame, loans: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _build_features(attributes: pd.DataFrame, financials: pd.DataFrame,
+                    clickstream: pd.DataFrame, loans: pd.DataFrame) -> pd.DataFrame:
+    """One row per loan application, using only data dated on or before the application."""
     applications = loans.loc[loans["mob"].eq(0),
                              ["loan_id", "customer_id", "loan_start_date", "loan_amt", "tenure"]].copy()
     applications = applications.rename(columns={"loan_start_date": "feature_as_of_date"})
@@ -173,15 +174,18 @@ def _build_gold(attributes: pd.DataFrame, financials: pd.DataFrame,
     features["clickstream_available"] = features["clickstream_snapshot_date"].notna().astype("int8")
     features["debt_to_annual_income"] = (features["outstanding_debt"] / features["annual_income"].where(features["annual_income"].gt(0)))
     features["emi_to_monthly_income"] = (features["total_emi_per_month"] / features["monthly_inhand_salary"].where(features["monthly_inhand_salary"].gt(0)))
+    return features
 
+
+def _build_labels(loans: pd.DataFrame) -> pd.DataFrame:
+    """Label = 1 when the loan is 30+ days past due at month-on-book 6."""
     labels = loans.loc[loans["mob"].eq(6),
                        ["loan_id", "customer_id", "loan_start_date", "snapshot_date", "dpd"]].copy()
     labels = labels.rename(columns={"loan_start_date": "feature_as_of_date",
                                     "snapshot_date": "label_observation_date"})
     labels["label"] = labels["dpd"].ge(30).astype("int8")
     labels["label_def"] = "30dpd_6mob"
-    labels = labels.drop(columns="dpd").sort_values(["feature_as_of_date", "loan_id"]).reset_index(drop=True)
-    return features, labels
+    return labels.drop(columns="dpd").sort_values(["feature_as_of_date", "loan_id"]).reset_index(drop=True)
 
 
 def _validate(features: pd.DataFrame, labels: pd.DataFrame) -> dict:
@@ -207,40 +211,130 @@ def _validate(features: pd.DataFrame, labels: pd.DataFrame) -> dict:
             "feature_max_date": str(features["feature_as_of_date"].max().date())}
 
 
-def prepare_datamart(force: bool = False) -> dict:
-    fingerprints = {name: _sha256(path) for name, path in SOURCE_FILES.items()}
-    transform_code_sha256 = _sha256(Path(__file__))
-    manifest_path = DATAMART_DIR / "data_manifest.json"
-    expected_outputs = [GOLD_DIR / "feature_store.parquet", GOLD_DIR / "label_store.parquet"]
-    if not force and manifest_path.exists() and all(path.exists() for path in expected_outputs):
-        manifest = json.loads(manifest_path.read_text())
-        if (manifest.get("source_sha256") == fingerprints
-                and manifest.get("transform_code_sha256") == transform_code_sha256):
-            return manifest
+# ---------------------------------------------------------------------------
+# Pipeline stages. Each Airflow task calls exactly one of these functions.
+# A stage is skipped when its inputs and this file are unchanged since its last
+# successful run, so repeated monthly runs never rewrite identical Gold files.
+# ---------------------------------------------------------------------------
 
-    raw = {name: pd.read_csv(path, dtype="string", keep_default_na=False)
-           for name, path in SOURCE_FILES.items()}
-    for name, frame in raw.items():
-        _save(frame, BRONZE_DIR / f"{name}.parquet")
+SILVER_NAMES = {
+    "features_attributes": "features_attributes",
+    "features_financials": "features_financials",
+    "feature_clickstream": "feature_clickstream",
+    "lms_loan_daily": "loan_daily",
+}
+SILVER_CLEANERS = {
+    "features_attributes": _clean_attributes,
+    "features_financials": _clean_financials,
+    "feature_clickstream": _clean_clickstream,
+    "lms_loan_daily": _clean_loans,
+}
+STAGE_DIR = DATAMART_DIR / "stage_manifests"
+FEATURE_STORE = GOLD_DIR / "feature_store.parquet"
+LABEL_STORE = GOLD_DIR / "label_store.parquet"
 
-    silver = {
-        "features_attributes": _clean_attributes(raw["features_attributes"]),
-        "features_financials": _clean_financials(raw["features_financials"]),
-        "feature_clickstream": _clean_clickstream(raw["feature_clickstream"]),
-        "loan_daily": _clean_loans(raw["lms_loan_daily"]),
-    }
-    for name, frame in silver.items():
-        _save(frame, SILVER_DIR / f"{name}.parquet")
 
-    features, labels = _build_gold(silver["features_attributes"], silver["features_financials"],
-                                   silver["feature_clickstream"], silver["loan_daily"])
-    summary = _validate(features, labels)
-    _save(features, expected_outputs[0])
-    _save(labels, expected_outputs[1])
-    manifest = {"source_sha256": fingerprints,
-                "transform_code_sha256": transform_code_sha256,
+def _bronze_path(source: str) -> Path:
+    return BRONZE_DIR / f"{source}.parquet"
+
+
+def _silver_path(source: str) -> Path:
+    return SILVER_DIR / f"{SILVER_NAMES[source]}.parquet"
+
+
+def _run_stage(stage: str, inputs: list[Path], outputs: list[Path], build, force: bool = False) -> dict:
+    state = {"inputs": {path.name: _sha256(path) for path in inputs},
+             "transform_code_sha256": _sha256(Path(__file__))}
+    manifest = STAGE_DIR / f"{stage}.json"
+    if (not force and manifest.exists() and all(path.exists() for path in outputs)
+            and json.loads(manifest.read_text()).get("state") == state):
+        print(f"[{stage}] inputs and code unchanged; reusing {len(outputs)} output file(s)")
+        return {"stage": stage, "status": "up_to_date"}
+    summary = build()
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"state": state, "summary": summary}, indent=2, default=str))
+    print(f"[{stage}] rebuilt: {summary}")
+    return {"stage": stage, "status": "rebuilt", **summary}
+
+
+def check_source_files() -> dict:
+    """Stop the run early if a supplied CSV is missing, empty or lacks its key columns."""
+    required = {"features_attributes": {"Customer_ID", "snapshot_date"},
+                "features_financials": {"Customer_ID", "snapshot_date"},
+                "feature_clickstream": {"Customer_ID", "snapshot_date"},
+                "lms_loan_daily": {"loan_id", "Customer_ID", "loan_start_date", "snapshot_date"}}
+    report = {}
+    for source, path in SOURCE_FILES.items():
+        if not path.exists() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"Source file missing or empty: {path.name}")
+        header = set(pd.read_csv(path, nrows=0).columns)
+        missing = required[source] - header
+        if missing:
+            raise ValueError(f"{path.name} is missing columns: {sorted(missing)}")
+        report[source] = {"bytes": path.stat().st_size}
+    print(f"[check_source_files] all {len(report)} source files present with key columns")
+    return report
+
+
+def build_bronze(source: str, force: bool = False) -> dict:
+    """Bronze keeps the supplied CSV exactly as text."""
+    def build():
+        raw = pd.read_csv(SOURCE_FILES[source], dtype="string", keep_default_na=False)
+        _save(raw, _bronze_path(source))
+        return {"rows": len(raw)}
+    return _run_stage(f"bronze_{source}", [SOURCE_FILES[source]], [_bronze_path(source)], build, force)
+
+
+def build_silver(source: str, force: bool = False) -> dict:
+    """Silver parses types, cleans placeholders and adds warning flags."""
+    def build():
+        clean = SILVER_CLEANERS[source](pd.read_parquet(_bronze_path(source)))
+        _save(clean, _silver_path(source))
+        return {"rows": len(clean)}
+    return _run_stage(f"silver_{source}", [_bronze_path(source)], [_silver_path(source)], build, force)
+
+
+def build_label_store(force: bool = False) -> dict:
+    def build():
+        labels = _build_labels(pd.read_parquet(_silver_path("lms_loan_daily")))
+        _save(labels, LABEL_STORE)
+        return {"rows": len(labels), "bad_rate": float(labels["label"].mean())}
+    return _run_stage("gold_label_store", [_silver_path("lms_loan_daily")], [LABEL_STORE], build, force)
+
+
+def build_feature_store(force: bool = False) -> dict:
+    inputs = [_silver_path(source) for source in SOURCE_FILES]
+
+    def build():
+        silver = {source: pd.read_parquet(_silver_path(source)) for source in SOURCE_FILES}
+        features = _build_features(silver["features_attributes"], silver["features_financials"],
+                                   silver["feature_clickstream"], silver["lms_loan_daily"])
+        _save(features, FEATURE_STORE)
+        return {"rows": len(features)}
+    return _run_stage("gold_feature_store", inputs, [FEATURE_STORE], build, force)
+
+
+def validate_gold_stores() -> dict:
+    """Quality gate between the data pipeline and the model pipeline."""
+    summary = _validate(pd.read_parquet(FEATURE_STORE), pd.read_parquet(LABEL_STORE))
+    manifest = {"source_sha256": {name: _sha256(path) for name, path in SOURCE_FILES.items()},
+                "transform_code_sha256": _sha256(Path(__file__)),
                 "summary": summary,
                 "lineage": "CS611 Assignment 1: application-time features and 30+ DPD at MOB 6"}
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    manifest_path = DATAMART_DIR / "data_manifest.json"
+    if not manifest_path.exists() or json.loads(manifest_path.read_text()) != manifest:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"[validate_gold_stores] passed: {summary}")
     return manifest
+
+
+def prepare_datamart(force: bool = False) -> dict:
+    """Run every data stage in DAG order (used by main.py, tests and experiments)."""
+    check_source_files()
+    for source in SOURCE_FILES:
+        build_bronze(source, force)
+        build_silver(source, force)
+    build_label_store(force)
+    build_feature_store(force)
+    return validate_gold_stores()

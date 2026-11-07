@@ -1,1 +1,1 @@
-"""Data-processing utilities for CS611 Assignment 1."""
+"""Data and model pipeline utilities for CS611 Assignment 2."""

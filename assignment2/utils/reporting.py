@@ -7,14 +7,71 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from utils.config import PROJECT_ROOT
+import json
+import math
+
+from utils.config import GOLD_DIR, PROJECT_ROOT
 from utils.model_pipeline import (MONITORING_DIR, FIXED_MONITORING_DIR,
                                   FEATURE_MONITORING_DIR, FIXED_FEATURE_MONITORING_DIR,
-                                  MONITORED_FEATURES)
+                                  MONITORED_FEATURES, MODEL_BANK, PREDICTIONS_DIR,
+                                  FIXED_PREDICTIONS_DIR, SCORE_THRESHOLD)
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
 TEAL = "#2A9D8F"
 ORANGE = "#F4A261"
+REVIEW_SHARES = (0.10, 0.20, 0.30, 0.50)
+
+
+def business_view(as_of: str) -> pd.DataFrame:
+    """Usefulness in business terms, on loans whose month-six outcome is known by as_of.
+
+    Each month, reviewers check the riskiest X% of that month's applications.
+    For each X we report how many flagged loans really went 30+ days late and
+    what share of all late loans the review would have caught.
+    """
+    labels = pd.read_parquet(GOLD_DIR / "label_store.parquet")[["loan_id", "label_observation_date", "label"]]
+    rows = []
+    for strategy, directory in [("monthly_selected", PREDICTIONS_DIR), ("fixed_june_2024", FIXED_PREDICTIONS_DIR)]:
+        paths = [p for p in sorted(directory.glob("cohort_date=*/predictions.parquet"))
+                 if p.parent.name.split("=", 1)[1] <= as_of]
+        if not paths:
+            continue
+        scored = pd.concat([pd.read_parquet(p) for p in paths]).merge(labels, on="loan_id", validate="one_to_one")
+        known = scored[scored["label_observation_date"].le(pd.Timestamp(as_of))].copy()
+        if known.empty:
+            continue
+        late_total = int(known["label"].sum())
+        rank = known.groupby("feature_as_of_date")["default_probability"].rank(method="first", ascending=False)
+        size = known.groupby("feature_as_of_date")["loan_id"].transform("size")
+        rules = [(f"riskiest {int(share * 100)}% each month", rank <= np.ceil(share * size))
+                 for share in REVIEW_SHARES]
+        rules.append((f"probability >= {SCORE_THRESHOLD}", known["default_probability"].ge(SCORE_THRESHOLD)))
+        for rule, flagged in rules:
+            caught = int((flagged & known["label"].eq(1)).sum())
+            rows.append({"as_of_date": as_of, "scoring_strategy": strategy, "review_rule": rule,
+                         "cohorts_with_known_outcome": int(known["feature_as_of_date"].nunique()),
+                         "applications": int(len(known)), "late_loans": late_total,
+                         "overall_late_rate": late_total / len(known),
+                         "flagged": int(flagged.sum()), "flagged_share": float(flagged.mean()),
+                         "late_among_flagged": caught / flagged.sum() if flagged.sum() else math.nan,
+                         "share_of_late_loans_caught": caught / late_total if late_total else math.nan})
+    return pd.DataFrame(rows)
+
+
+def tuning_summary(as_of: str) -> pd.DataFrame:
+    """Every grid setting tried by every model trained up to as_of."""
+    rows = []
+    for path in sorted(MODEL_BANK.glob("credit_model_*.json")):
+        metadata = json.loads(path.read_text())
+        if metadata["as_of_date"] > as_of:
+            continue
+        for trial in metadata.get("tuning_results", []):
+            rows.append({"model_version": metadata["model_version"], "algorithm": trial["algorithm"],
+                         "params": json.dumps(trial["params"], sort_keys=True),
+                         "validation_auc": trial["validation_auc"],
+                         "selected": (trial["algorithm"] == metadata["selected_algorithm"]
+                                      and trial["params"] == metadata.get("selected_params"))})
+    return pd.DataFrame(rows)
 
 
 def _style(ax):
@@ -98,6 +155,13 @@ def render_monitoring(as_of: str) -> dict:
     feature_chart = REPORTS_DIR / f"feature_monitoring_as_of_{as_of}.png"
     fig.savefig(feature_chart, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+
+    business = business_view(as_of)
+    if not business.empty:
+        business.to_csv(REPORTS_DIR / f"business_view_as_of_{as_of}.csv", index=False)
+    tuning = tuning_summary(as_of)
+    if not tuning.empty:
+        tuning.to_csv(REPORTS_DIR / f"tuning_results_as_of_{as_of}.csv", index=False)
     return {"as_of_date": as_of, "chart": str(chart), "feature_chart": str(feature_chart),
             "cohorts": int(len(data)), "mature_cohorts": int(data["roc_auc"].notna().sum()),
             "monitored_features": len(MONITORED_FEATURES)}

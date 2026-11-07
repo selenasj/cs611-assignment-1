@@ -60,21 +60,48 @@ def _matrix(frame: pd.DataFrame) -> pd.DataFrame:
     return mask_invalid_count_values(numeric).replace([np.inf, -np.inf], np.nan)
 
 
-def _candidates() -> dict[str, Pipeline]:
-    return {
-        "logistic_regression": Pipeline([
+# Basic hyperparameter tuning: a small grid per algorithm. Every setting is
+# fitted on the training cohorts and scored on the same two temporal validation
+# cohorts; the single best setting across both algorithms is then refitted.
+SEARCH_SPACE = {
+    "logistic_regression": [{"C": c} for c in (0.1, 1.0, 10.0)],
+    "hist_gradient_boosting": [
+        {"learning_rate": rate, "max_leaf_nodes": leaves}
+        for rate in (0.03, 0.05, 0.1)
+        for leaves in (7, 15, 31)
+    ],
+}
+
+
+def _build_pipeline(algorithm: str, params: dict) -> Pipeline:
+    """Preprocessing lives inside the pipeline, so it is fitted on training rows only."""
+    if algorithm == "logistic_regression":
+        return Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", RobustScaler()),
-            ("classifier", LogisticRegression(max_iter=2000, random_state=88)),
-        ]),
-        "hist_gradient_boosting": Pipeline([
+            ("classifier", LogisticRegression(max_iter=2000, random_state=88, **params)),
+        ])
+    if algorithm == "hist_gradient_boosting":
+        return Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("classifier", HistGradientBoostingClassifier(
-                max_iter=100, max_leaf_nodes=15, learning_rate=0.05,
-                l2_regularization=2.0, random_state=88,
+                max_iter=100, l2_regularization=2.0, random_state=88, **params,
             )),
-        ]),
-    }
+        ])
+    raise ValueError(f"Unknown algorithm: {algorithm}")
+
+
+def tune_on_validation(train: pd.DataFrame, validation: pd.DataFrame) -> list[dict]:
+    """Score every grid setting on the temporal validation cohorts."""
+    results = []
+    for algorithm, grid in SEARCH_SPACE.items():
+        for params in grid:
+            pipeline = _build_pipeline(algorithm, params)
+            pipeline.fit(_matrix(train), train["label"])
+            probabilities = pipeline.predict_proba(_matrix(validation))[:, 1]
+            results.append({"algorithm": algorithm, "params": dict(params),
+                            "validation_auc": float(roc_auc_score(validation["label"], probabilities))})
+    return results
 
 
 def _reference(values: np.ndarray | pd.Series, bins: int = 10) -> dict:
@@ -196,13 +223,13 @@ def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
     if train["label"].nunique() < 2 or validation["label"].nunique() < 2:
         raise ValueError("Both classes are required for temporal AUC model selection")
 
-    results: dict[str, float] = {}
-    for name, pipeline in _candidates().items():
-        pipeline.fit(_matrix(train), train["label"])
-        probabilities = pipeline.predict_proba(_matrix(validation))[:, 1]
-        results[name] = float(roc_auc_score(validation["label"], probabilities))
-    selected_name = max(results, key=results.get)
-    selected = _candidates()[selected_name]
+    tuning = tune_on_validation(train, validation)
+    # Best tuned validation AUC per algorithm, used for the algorithm comparison.
+    results = {algorithm: max(row["validation_auc"] for row in tuning if row["algorithm"] == algorithm)
+               for algorithm in SEARCH_SPACE}
+    best = max(tuning, key=lambda row: row["validation_auc"])
+    selected_name = best["algorithm"]
+    selected = _build_pipeline(selected_name, best["params"])
     selected.fit(_matrix(matured), matured["label"])
     reference_scores = selected.predict_proba(_matrix(matured))[:, 1]
     references = {"score": _reference(reference_scores)}
@@ -214,8 +241,10 @@ def train_and_select(as_of: str | pd.Timestamp, force: bool = False) -> dict:
         "model_version": version,
         "as_of_date": date.strftime("%Y-%m-%d"),
         "selected_algorithm": selected_name,
+        "selected_params": best["params"],
         "candidate_validation_auc": results,
-        "selected_validation_auc": results[selected_name],
+        "selected_validation_auc": best["validation_auc"],
+        "tuning_results": tuning,
         "train_rows_for_selection": int(len(train)),
         "validation_rows": int(len(validation)),
         "refit_rows": int(len(matured)),
@@ -432,9 +461,15 @@ def _monitor_strategy(as_of: str | pd.Timestamp, predictions_dir: Path,
             "path": str(output)}
 
 
+def monitor_monthly_model(as_of: str | pd.Timestamp) -> dict:
+    return _monitor_strategy(as_of, PREDICTIONS_DIR, MONITORING_DIR,
+                             FEATURE_MONITORING_DIR, "monthly_selected")
+
+
+def monitor_fixed_model(as_of: str | pd.Timestamp) -> dict:
+    return _monitor_strategy(as_of, FIXED_PREDICTIONS_DIR, FIXED_MONITORING_DIR,
+                             FIXED_FEATURE_MONITORING_DIR, "fixed_june_2024")
+
+
 def monitor_as_of(as_of: str | pd.Timestamp) -> dict:
-    monthly = _monitor_strategy(as_of, PREDICTIONS_DIR, MONITORING_DIR,
-                                FEATURE_MONITORING_DIR, "monthly_selected")
-    fixed = _monitor_strategy(as_of, FIXED_PREDICTIONS_DIR, FIXED_MONITORING_DIR,
-                              FIXED_FEATURE_MONITORING_DIR, "fixed_june_2024")
-    return {**monthly, "fixed_comparator": fixed}
+    return {**monitor_monthly_model(as_of), "fixed_comparator": monitor_fixed_model(as_of)}
