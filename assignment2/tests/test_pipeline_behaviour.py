@@ -8,13 +8,14 @@ import pandas as pd
 from sklearn.impute import SimpleImputer
 
 from utils.config import GOLD_DIR, PROJECT_ROOT
-from utils.data_pipeline import prepare_datamart
+from utils.data_pipeline import _sha256, build_label_store, prepare_datamart
 from utils.feature_policy import APPROVED_NUMERIC_FEATURES
 from utils.model_pipeline import (
-    MODEL_BANK, MONITORING_DIR, PREDICTIONS_DIR,
+    MODEL_BANK, MONITORING_DIR, PREDICTIONS_DIR, SEARCH_SPACE,
     _matrix, _reference, _stability_flags, population_stability_index,
     score_cohort, train_and_select,
 )
+from utils.reporting import business_view
 
 
 class PipelineBehaviourTest(unittest.TestCase):
@@ -99,6 +100,30 @@ class PipelineBehaviourTest(unittest.TestCase):
         self.assertEqual(len(proportions), len(edges))
         # A constant sample fully in a single bin must be distinguishable from the baseline.
         self.assertGreater(population_stability_index(reference, [0.5] * 100), 0)
+
+    def test_tuning_grid_is_recorded_and_best_setting_is_selected(self):
+        grid_size = sum(len(grid) for grid in SEARCH_SPACE.values())
+        for path in sorted(MODEL_BANK.glob("*.joblib")):
+            metadata = joblib.load(path)["metadata"]
+            trials = metadata["tuning_results"]
+            self.assertEqual(len(trials), grid_size)
+            best = max(trials, key=lambda row: row["validation_auc"])
+            self.assertEqual(metadata["selected_algorithm"], best["algorithm"])
+            self.assertEqual(metadata["selected_params"], best["params"])
+            self.assertAlmostEqual(metadata["selected_validation_auc"], best["validation_auc"])
+
+    def test_unchanged_data_stage_is_reused_without_rewriting(self):
+        before = _sha256(GOLD_DIR / "label_store.parquet")
+        self.assertEqual(build_label_store()["status"], "up_to_date")
+        self.assertEqual(_sha256(GOLD_DIR / "label_store.parquet"), before)
+
+    def test_business_view_counts_are_consistent(self):
+        view = business_view("2025-08-01")
+        monthly = view[view["scoring_strategy"].eq("monthly_selected")]
+        self.assertEqual(set(monthly["applications"]), {4024})
+        self.assertTrue(monthly["share_of_late_loans_caught"].between(0, 1).all())
+        reviewed = monthly[monthly["review_rule"].str.startswith("riskiest")]
+        self.assertTrue(reviewed["share_of_late_loans_caught"].is_monotonic_increasing)
 
     def test_nullable_numeric_reference(self):
         values = pd.Series([1.0, 2.0, pd.NA], dtype="Float64")
